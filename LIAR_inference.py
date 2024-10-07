@@ -70,12 +70,43 @@ def parse_arguments():
         help='Specify whether to perform binary classification. Default is True. Set to False for multiclass classification.'
     )
 
+    parser.add_argument(
+        '--score-optimized',
+        action='store_true',
+        default=False,
+        help='Optimize threshold for maximum accuracy'
+    )
+
+    parser.add_argument(
+        '--few-shot',
+        action='store_true',
+        default=False,
+    )
+
     args = parser.parse_args()
     return args
 
+def find_best_thresholds(numerical_outputs, y_true, num_classes):
+    best_accuracy = 0
+    best_threshold = 0
+
+    for t1 in np.linspace(0, 100, 101, dtype=np.int8):
+        
+        bin_edges = np.array([0, t1, 100])
+        binned_numbers = np.digitize(numerical_outputs, bins=bin_edges, right=False) - 1
+        y_pred = np.clip(binned_numbers, 0, num_classes - 1) # for the number 100 to be put in last class
+        
+        accuracy = accuracy_score(y_true, y_pred)
+        
+        if accuracy > best_accuracy:
+            best_accuracy = accuracy
+            best_threshold = t1
+            print(best_threshold)
+    
+    return best_threshold, best_accuracy
+
 
 def inference(args):
-
     test_data, num_classes = data_prep(args)
         
     # Create an LLM.
@@ -103,6 +134,7 @@ def inference(args):
         "Do not provide any explanations, only respond with the numerical score."
     )
 
+
     # prefix = ("Rate the truthfulness of the following statement: "
     #     "{{{0}}} Provide a number 0 or 1, where 0 represents false "
     #     "and 1 represents true. "
@@ -111,6 +143,7 @@ def inference(args):
 
     # prompts = test_data['statement'].sample(frac = 1)
     prompts = test_data['statement']
+    
 
     generating_prompts = tokenizer.apply_chat_template([
         [{"role": "user", "content": prefix.format(prompt)}] for prompt in prompts
@@ -130,16 +163,17 @@ def inference(args):
             number = random.randint(0, 100)
         numerical_outputs.append(number)
 
-
-    bin_edges = np.linspace(0, 100, num_classes + 1)
-    
-    binned_numbers = np.digitize(numerical_outputs, bins=bin_edges, right=False) - 1
-    y_pred = np.clip(binned_numbers, 0, num_classes - 1) # for the number 100 to be put in last class
-
     y_true =  test_data['output']
 
-
-    acc = accuracy_score(y_true, y_pred)
+    if args.score_optimized:
+        threshold, acc = find_best_thresholds(numerical_outputs, y_true, num_classes)
+        print(threshold)
+    else:
+        bin_edges = np.linspace(0, 100, num_classes + 1)
+        binned_numbers = np.digitize(numerical_outputs, bins=bin_edges, right=False) - 1
+        y_pred = np.clip(binned_numbers, 0, num_classes - 1) # for the number 100 to be put in last class
+        acc= accuracy_score(y_true, y_pred)
+    
     print(acc)
 
     test_data['pred'] = numerical_outputs
