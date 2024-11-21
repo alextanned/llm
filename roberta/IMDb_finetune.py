@@ -23,6 +23,46 @@ from transformers import (
     AutoModel
 )
 
+token_class_mapping = {
+    31587: 1,
+    36590: 1,
+    69788: 1,
+    55260: 1,
+    981: 1,
+    17914: 1,
+    4964: 1,
+    45003: 1,
+    6928: 1,
+    43324: 0, 
+    39589: 0, 
+    62035: 0, 
+    54965: 0, 
+    29875: 0, 
+    98227: 0, 
+    48900: 0, 
+    51957: 0, 
+    8389: 0
+}
+# token_class_mapping = {
+#     'positive': 'positive',
+#     'Positive': 'positive',
+#     '-positive': 'positive',
+#     '_positive': 'positive',
+#     'pos': 'positive',
+#     'POS': 'positive',
+#     'Pos': 'positive',
+#     ' Positive': 'positive',
+#     ' positive': 'positive',
+#     'negative': 'negative',
+#     'Negative': 'negative',
+#     '-negative': 'negative',
+#     '_negative': 'negative',
+#     'neg': 'negative',
+#     'NEG': 'negative',
+#     'Neg': 'negative',
+#     ' Negative': 'negative',
+#     ' negative': 'negative',
+# }
 
 def data_prep(args, split='train'):
 
@@ -48,6 +88,9 @@ def data_prep(args, split='train'):
 
     return X_train, y_train, X_test, y_test, num_classes
 
+def read_logprobs(args, split='train'):
+    logprobs = pd.read_pickle("../../../data/IMDB_Finetune/{}/logprobs.pkl".format(split))
+    return logprobs['logprbs'].to_list()
 
 def format_time(elapsed):
     '''
@@ -133,8 +176,21 @@ def parse_arguments():
         default=False,
         help='use extra data'
     )
+    
+    parser.add_argument(
+        '--kd',
+        action='store_true',
+        default=False,
+        help='Use logprobs.'
+    )
 
-
+    parser.add_argument(
+        '--alpha',
+        type=float,
+        default=0.5,
+        required=False,
+        help='Controls the balance between kd loss and classification loss.'
+    )
     args = parser.parse_args()
     return args
 
@@ -155,8 +211,45 @@ def get_max_length(sentences, tokenizer):
     
     print(max_length)
     return max_length
+
+def aggregate_logprobs(logprobs):
+
+    # all_class_logprob = []
+    # for sample in logprobs:
+    #     class_logprobs = [[], []]  # Assuming binary classification 0: [], 1:[]
+
+    #     for token_id, logprob in sample.items():
+    #         class_id = token_class_mapping.get(token_id)
+    #         if class_id is not None:
+    #             class_logprobs[class_id].append(logprob)
+
+
+    #     logprobs_tensor = torch.tensor(class_logprobs)
+    #     class_logprob = torch.logsumexp(logprobs_tensor, dim=1)
+    #     all_class_logprob.append(class_logprob)
+    # return all_class_logprob
+
+    # logprobs: list of logprobs, each item in list has n number of keys
+    # n = number of logprobs returned from LLM
+    all_class_logprob = []
+    for sample in logprobs:
+        class_logprobs = [[], []]  # Assuming binary classification 0: [], 1:[]
+        for token_id, logprob in sample.items():
+            class_id = token_class_mapping.get(token_id)
+            if class_id is not None:
+                class_logprobs[class_id].append(logprob)
+        
+        for i in range(len(class_logprobs)):
+            logprobs_tensor = torch.tensor(class_logprobs[i])
+            class_logprob = torch.logsumexp(logprobs_tensor, dim=0)
+            class_logprobs[i] = class_logprob
+        
+        all_class_logprob.append(torch.tensor(class_logprobs))
+    # res = torch.stack(all_class_logprob)
+    return all_class_logprob
+
     
-def create_dataset(sentences, tokenizer, labels):
+def create_dataset(sentences, tokenizer, labels, logprobs=None):
     # Tokenize the sentences
     input_ids = []
     attention_masks = []
@@ -184,6 +277,10 @@ def create_dataset(sentences, tokenizer, labels):
     input_ids = torch.cat(input_ids, dim=0)
     attention_masks = torch.cat(attention_masks, dim=0)
     labels = torch.tensor(labels)
+    if logprobs:
+        all_class_logprob = aggregate_logprobs(logprobs)
+        dataset = torch.utils.data.TensorDataset(input_ids, attention_masks, labels, torch.stack(all_class_logprob))
+        return dataset
     
     # Create a TensorDataset with the input_ids, attention_masks, and labels
     dataset = torch.utils.data.TensorDataset(input_ids, attention_masks, labels)
@@ -225,7 +322,9 @@ def get_scheduler(dataloader, optimizer, extradataloader=None):
     # Create the learning rate scheduler.
     # scheduler = torch.optim.lr_scheduler.LinearLR(optimizer,                                                
     #                                             total_iters = total_steps)
-    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
+    if not extradataloader:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
+        return scheduler
     first_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(extradataloader)* wandb.config.extra_epochs)
     second_scheduler= torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(dataloader)* (wandb.config.epochs-wandb.config.extra_epochs))
 
@@ -237,6 +336,24 @@ def flat_accuracy(preds, labels):
     pred_flat = np.argmax(preds, axis=1).flatten()
     labels_flat = labels.flatten()
     return np.sum(pred_flat == labels_flat) / len(labels_flat)
+
+def get_kl_loss(student_logits, teacher_class_logprobs, T, kl_div_loss):
+    # Temperature scaling
+    teacher_log_probs_scaled = teacher_class_logprobs / T
+    student_logits_scaled = student_logits / T
+
+    # Convert teacher's log probabilities to probabilities
+    teacher_probs = torch.exp(teacher_log_probs_scaled)
+    normalized_teacher_probs = teacher_probs / teacher_probs.sum(dim=-1, keepdim=True)
+
+    # Compute student's log probabilities
+    student_log_probs = torch.nn.functional.log_softmax(student_logits_scaled, dim=-1)
+
+    # Compute distillation loss
+    # kl_div_loss = torch.nn.KLDivLoss(reduction='batchmean')
+    loss = kl_div_loss(student_log_probs, normalized_teacher_probs) * (T ** 2)
+    return loss
+
 
 def train(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -264,8 +381,10 @@ def train(args):
     # max_length = get_max_length(train_sentences+val_sentences, tokenizer)
 
     # Create datasets
-    train_dataset = create_dataset(train_sentences, tokenizer,train_labels)
-    val_dataset = create_dataset(val_sentences, tokenizer, val_labels)
+    train_logprobs = None if not args.kd else read_logprobs(args, split='train')
+    val_logprobs = None if not args.kd else read_logprobs(args, split='val')
+    train_dataset = create_dataset(train_sentences, tokenizer,train_labels, train_logprobs)
+    val_dataset = create_dataset(val_sentences, tokenizer, val_labels, val_logprobs)
     if args.extra:
         extra_dataset = create_dataset(extra_sentences, tokenizer, extra_labels)
 
@@ -284,11 +403,15 @@ def train(args):
             extra_dataset,  # The training samples.
             sampler= torch.utils.data.RandomSampler(extra_dataset), # Select batches randomly
             batch_size=wandb.config.batch_size, # Trains with this batch size.
-    )
+        )
+    else:
+        extra_dataloader = None
 
     # Get optimizer and scheduler
     optimizer = get_optimizer(model)
     scheduler = get_scheduler(train_dataloader, optimizer, extra_dataloader)
+    if args.kd:
+        kl_div_loss = torch.nn.KLDivLoss(reduction='batchmean')
     seed_val=6
     random.seed(seed_val)
     np.random.seed(seed_val)
@@ -320,6 +443,7 @@ def train(args):
 
         # Reset the total loss for this epoch.
         total_train_loss = 0
+        total_kd_loss = 0
 
         # Put the model into training mode. Don't be mislead--the call to 
         # `train` just changes the *mode*, it doesn't *perform* the training.
@@ -367,16 +491,24 @@ def train(args):
             # arge given and what flags are set. For our useage here, it returns
             # the loss (because we provided labels) and the "logits"--the model
             # outputs prior to activation.
-            loss, logits = model(b_input_ids, 
+            model_loss, logits = model(b_input_ids, 
                                 token_type_ids=None, 
                                 attention_mask=b_input_mask, 
                                 labels=b_labels).to_tuple()
+            
+            if args.kd:
+                b_logprobs = batch[3].to(device)
+                kd_loss = get_kl_loss(logits, b_logprobs, 2.0, kl_div_loss)
+                total_kd_loss += kd_loss.item()
+                loss = (kd_loss * args.alpha) + (1-args.alpha)*model_loss
+            else:
+                loss = model_loss
 
             # Accumulate the training loss over all of the batches so that we can
             # calculate the average loss at the end. `loss` is a Tensor containing a
             # single value; the `.item()` function just returns the Python value 
             # from the tensor.
-            total_train_loss += loss.item()
+            total_train_loss += model_loss.item()
 
             # Perform a backward pass to calculate the gradients.
             loss.backward()
@@ -400,8 +532,12 @@ def train(args):
 
                 # Report progress.
                 print('  Batch {:>5,}  of  {:>5,}.    Elapsed: {:}.'.format(step, len(loader), elapsed))
+                
                 avg_train_loss = total_train_loss / step
-                wandb.log({'train_loss':avg_train_loss})
+                print(avg_train_loss)
+                # avg_train_loss = model_loss.item()
+                avg_kd_loss = total_kd_loss / step
+                wandb.log({'train_loss':avg_train_loss, 'train_kd_loss': avg_kd_loss})
 
             logits = logits.detach().cpu().numpy()
             label_ids = b_labels.to('cpu').numpy()
@@ -529,7 +665,7 @@ def train(args):
         
         # Measure how long the testing run took.
         testing_time = format_time(time.time() - t0)
-        wandb.log({'avg_test_accuracy':avg_test_accuracy,'avg_test_loss':avg_test_loss, 'test_macro_f1': f1})
+        wandb.log({'avg_test_accuracy':avg_test_accuracy,'avg_test_loss':avg_test_loss, 'test_macro_f1': f1}) 
         print("  testing loss: {0:.2f}".format(avg_test_loss))
         print("  testing took: {:}".format(testing_time))
 

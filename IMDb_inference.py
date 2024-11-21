@@ -150,7 +150,7 @@ def inference(args):
             temperature=0,
             top_p=1.0,
             max_tokens=128,
-            logprobs=10,
+            logprobs=100,
             # logit_bias={43324:10, 31587:10}
             # stop_token_ids=[regular_tokenizer.eos_token_id, regular_tokenizer.convert_tokens_to_ids("<|eot_id|>")],  # KEYPOINT HERE
         )
@@ -194,6 +194,7 @@ def inference(args):
         sampling_params   )
 
     numerical_outputs = []
+    logprobs = []
     for i, output in enumerate(outputs):
         # print(repr(output.outputs[0].text))
         # print()
@@ -217,6 +218,9 @@ def inference(args):
             # If conversion fails, replace with a random integer between 0 and 100
             number = random.randint(0, 1)
         numerical_outputs.append(number)
+        output_logprobs = output.outputs[0].logprobs[4]
+        output_logprobs = {key: value.logprob for key, value in output_logprobs.items()}
+        logprobs.append(output_logprobs)
 
     
     if args.extra:
@@ -224,7 +228,9 @@ def inference(args):
         labeled = pd.DataFrame({'review': X_test, 'filename':files, 'label': numerical_outputs})
         labeled.to_pickle("../../data/IMDB_Finetune/extra/extra_llama3.1.pkl")
         exit()
-
+    
+    # logprobs = pd.DataFrame({'logprbs': logprobs})
+    # logprobs.to_pickle("../../data/IMDB_Finetune/{}/logprobs.pkl".format(args.split))
 
     
     if args.score_optimized:
@@ -250,10 +256,48 @@ def inference(args):
         f.write(str(acc))
         f.writelines([o.outputs[0].text.split("\n")[-1] for o in outputs])
     
-    return outputs
+    return outputs, logprobs
 
 if __name__ == "__main__":
     args = parse_arguments()
+    token_class_mapping = {
+        31587: 1,
+        36590: 1,
+        69788: 1,
+        55260: 1,
+        981: 1,
+        17914: 1,
+        4964: 1,
+        45003: 1,
+        6928: 1,
+        43324: 0, 
+        39589: 0, 
+        62035: 0, 
+        54965: 0, 
+        29875: 0, 
+        98227: 0, 
+        48900: 0, 
+        51957: 0, 
+        8389: 0
+    }
+    output, logprobs = inference(args)
+    import torch
+    all_class_logprob = []
+    for sample in logprobs:
+        class_logprobs = [[], []]  # Assuming binary classification 0: [], 1:[]
+        for token_id, logprob in sample.items():
+            class_id = token_class_mapping.get(token_id)
+            if class_id is not None:
+                class_logprobs[class_id].append(logprob)
+        
+        for i in range(len(class_logprobs)):
+            logprobs_tensor = torch.tensor(class_logprobs[i])
+            class_logprob = torch.logsumexp(logprobs_tensor, dim=0)
+            class_logprobs[i] = class_logprob
+        
+        all_class_logprob.append(torch.tensor(class_logprobs))
+    res = torch.stack(all_class_logprob)
+    print(torch.count_nonzero(torch.abs(torch.diff(torch.exp(res)))<0.8))
 
-    output = inference(args)
+
 
