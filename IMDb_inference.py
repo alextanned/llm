@@ -199,7 +199,7 @@ def inference(args):
         # print(repr(output.outputs[0].text))
         # print()
         try:
-
+    
             rating = output.outputs[0].text.split("\n")[-1].lower()
 
             # if rating == "negative":
