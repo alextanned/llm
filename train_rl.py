@@ -1,19 +1,23 @@
-import os
-import sys
-import os
-import wandb
-from huggingface_hub import login
-from transformers import AutoTokenizer
-from datasets import load_dataset
 import re
-from trl import GRPOConfig, GRPOTrainer, get_peft_config, ModelConfig
 
+from datasets import load_dataset
+from huggingface_hub import login
+from transformers import AutoModelForCausalLM
+from trl import GRPOConfig, GRPOTrainer, get_peft_config, ModelConfig
+from unsloth import FastLanguageModel
+
+import wandb
 
 with open("hf_token.txt", "r") as f:
     token = f.read()
 login(token=token, add_to_git_credential=True)
 
-model_name = "Qwen/Qwen2.5-1.5B-Instruct"
+model_name = "unsloth/Qwen2.5-3B-Instruct-bnb-4bit"
+
+model, tokenizer = FastLanguageModel.from_pretrained(model_name,
+                                              max_seq_length=720,
+                                              load_in_4bit=True,
+                                              )
 
 # Load dataset from Hugging Face Hub
 dataset_id = "Jiayi-Pan/Countdown-Tasks-3to4"
@@ -21,24 +25,25 @@ dataset = load_dataset(dataset_id, split="train")
 # select a random subset of 50k samples
 dataset = dataset.shuffle(seed=42).select(range(50000))
 
-# Load tokenizer from Hugging Face Hub to format the dataset to our "r1" prompt
-tokenizer = AutoTokenizer.from_pretrained(model_name)
 
 # gemerate r1 prompt with a prefix for the model to already start with the thinking process
 def generate_r1_prompt(numbers, target):
     r1_prefix = [{
         "role": "system",
         "content": "You are a helpful assistant. You first thinks about the reasoning process in the mind and then provides the user with the answer."
-      },
-      {
-        "role": "user",
-        "content": f"Using the numbers {numbers}, create an equation that equals {target}. You can use basic arithmetic operations (+, -, *, /) and each number can only be used once. Show your work in <think> </think> tags. And return the final equation and answer in <answer> </answer> tags, for example <answer> (1 + 2) / 3 = 1 </answer>." # Use <think> and <answer> tags exactly once."
-      },
-      {
-        "role": "assistant",
-        "content": "Let me solve this step by step.\n<think>"
-      }]
-    return {"prompt": tokenizer.apply_chat_template(r1_prefix, tokenize=False, continue_final_message=True), "target": target}
+    },
+        {
+            "role": "user",
+            "content": f"Using the numbers {numbers}, create an equation that equals {target}. You can use basic arithmetic operations (+, -, *, /) and each number can only be used once. Show your work in <think> </think> tags. And return the final equation and answer in <answer> </answer> tags, for example <answer> (1 + 2) / 3 = 1 </answer>."
+            # Use <think> and <answer> tags exactly once."
+        },
+        {
+            "role": "assistant",
+            "content": "Let me solve this step by step.\n<think>"
+        }]
+    return {"prompt": tokenizer.apply_chat_template(r1_prefix, tokenize=False, continue_final_message=True),
+            "target": target}
+
 
 # convert our dataset to the r1 prompt
 dataset = dataset.map(lambda x: generate_r1_prompt(x["nums"], x["target"]))
@@ -48,6 +53,7 @@ train_test_split = dataset.train_test_split(test_size=0.1)
 
 train_dataset = train_test_split["train"]
 test_dataset = train_test_split["test"]
+
 
 def format_reward_func(completions, target, **kwargs):
     """
@@ -63,23 +69,22 @@ def format_reward_func(completions, target, **kwargs):
 
     for completion, gt in zip(completions, target):
 
-      try:
-        # add synthetic <think> as its already part of the prompt and prefilled for the assistant to more easily match the regex
-        completion = "<think>" + completion
-        # Check if the format is correct
-        regex = r"^<think>([^<]*(?:<(?!/?think>)[^<]*)*)<\/think>\n<answer>([\s\S]*?)<\/answer>$"
+        try:
+            # add synthetic <think> as its already part of the prompt and prefilled for the assistant to more easily match the regex
+            completion = "<think>" + completion
+            # Check if the format is correct
+            regex = r"^<think>([^<]*(?:<(?!/?think>)[^<]*)*)<\/think>\n<answer>([\s\S]*?)<\/answer>$"
 
-        match = re.search(regex, completion, re.DOTALL)
-        print(completion)
-        print("\n\n\n")
-        # if the format is not correct, reward is 0
-        if match is None or len(match.groups()) != 2:
+            match = re.search(regex, completion, re.DOTALL)
+            # if the format is not correct, reward is 0
+            if match is None or len(match.groups()) != 2:
+                rewards.append(0.0)
+            else:
+                rewards.append(1.0)
+        except Exception:
             rewards.append(0.0)
-        else:
-            rewards.append(1.0)
-      except Exception:
-        rewards.append(0.0)
     return rewards
+
 
 def equation_reward_func(completions, target, nums, **kwargs):
     """
@@ -96,81 +101,76 @@ def equation_reward_func(completions, target, nums, **kwargs):
     """
     rewards = []
     for completion, gt, numbers in zip(completions, target, nums):
-      try:
-        # add synthetic <think> as its already part of the prompt and prefilled for the assistant to more easily match the regex
-        completion = "<think>" + completion
-        # Check if the format is correct
-        match = re.search(r"<answer>(.*?)<\/answer>", completion)
-        if match is None:
-            rewards.append(0.0)
-            continue
-        # Extract the "answer" part from the completion
-        equation = match.group(1).strip()
-        # Extract all numbers from the equation
-        used_numbers = [int(n) for n in re.findall(r'\d+', equation)]
+        try:
+            # add synthetic <think> as its already part of the prompt and prefilled for the assistant to more easily match the regex
+            completion = "<think>" + completion
+            # Check if the format is correct
+            match = re.search(r"<answer>(.*?)<\/answer>", completion)
+            if match is None:
+                rewards.append(0.0)
+                continue
+            # Extract the "answer" part from the completion
+            equation = match.group(1).strip()
+            # Extract all numbers from the equation
+            used_numbers = [int(n) for n in re.findall(r'\d+', equation)]
 
-        # Check if all numbers are used exactly once
-        if sorted(used_numbers) != sorted(numbers):
-            rewards.append(0.0)
-            continue
-        # Define a regex pattern that only allows numbers, operators, parentheses, and whitespace
-        allowed_pattern = r'^[\d+\-*/().\s]+$'
-        if not re.match(allowed_pattern, equation):
-           rewards.append(0.0)
-           continue
+            # Check if all numbers are used exactly once
+            if sorted(used_numbers) != sorted(numbers):
+                rewards.append(0.0)
+                continue
+            # Define a regex pattern that only allows numbers, operators, parentheses, and whitespace
+            allowed_pattern = r'^[\d+\-*/().\s]+$'
+            if not re.match(allowed_pattern, equation):
+                rewards.append(0.0)
+                continue
 
-        # Evaluate the equation with restricted globals and locals
-        result = eval(equation, {"__builtins__": None}, {})
-        print("suggested_answer: ", result, "gt: ", gt)
-        # Check if the equation is correct and matches the ground truth
-        if abs(float(result) - float(gt)) < 1e-5:
-            rewards.append(1.0)
-        else:
-            rewards.append(0.0)
-      except Exception:
+            # Evaluate the equation with restricted globals and locals
+            result = eval(equation, {"__builtins__": None}, {})
+            print("suggested_answer: ", result, "gt: ", gt)
+            # Check if the equation is correct and matches the ground truth
+            if abs(float(result) - float(gt)) < 1e-5:
+                rewards.append(1.0)
+            else:
+                rewards.append(0.0)
+        except Exception:
             # If evaluation fails, reward is 0
             rewards.append(0.0)
     return rewards
 
 
-# our model we are going to use as policy
-model_config = ModelConfig(
-    model_name_or_path=model_name,
-    torch_dtype="bfloat16",
-    attn_implementation="flash_attention_2",
-    use_peft=True,
-    load_in_4bit=True,
-)
-
 # Hyperparameters
 training_args = GRPOConfig(
-    output_dir="out",
+    output_dir="out/group-8",
     learning_rate=5e-7,
     lr_scheduler_type="cosine",
     logging_steps=1,
-    max_steps=100,
+    max_steps=450,
     per_device_train_batch_size=1,
-    gradient_accumulation_steps=1,
-    gradient_checkpointing=True,
-    gradient_checkpointing_kwargs={"use_reentrant": False},
+    gradient_accumulation_steps=8,
+    gradient_checkpointing=False,
+    warmup_ratio=0.03,
+    # gradient_checkpointing_kwargs={"use_reentrant": False},
     bf16=True,
     save_strategy="steps",
-    save_steps=0.1,
+    save_steps=50,
     # GRPO specific parameters
-    max_prompt_length=256,
-    max_completion_length=1024, # max length of the generated output for our solution
-    num_generations=8,
+    max_prompt_length=160,
+    max_completion_length=512,  # max length of the generated output for our solution
+    num_generations=4,
     beta=0.001,
     report_to="wandb",
+    use_vllm=True,
+    vllm_device="cuda:0",
+    vllm_gpu_memory_utilization=0.4,
 )
 
 run = wandb.init(
     project="LLM-RL",
-    config=model_config.__dict__ | training_args.__dict__,
+    config=model.__dict__ | training_args.__dict__,
 )
 
 trainer = GRPOTrainer(
-    model=model_config.model_name_or_path,
+    model=model,
     reward_funcs=[format_reward_func, equation_reward_func],
     args=training_args,
     train_dataset=train_dataset,
@@ -180,3 +180,4 @@ trainer = GRPOTrainer(
 
 print(run.get_url())
 trainer.train()
+trainer.save_model(training_args.output_dir)
