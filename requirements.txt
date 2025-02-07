@@ -10,3 +10,4 @@ vllm==0.7.0
 bitsandbytes
 peft
 wandb
+hydra-core

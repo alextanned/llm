@@ -1,0 +1,25 @@
+defaults:
+  - algo_base
+
+name: ""
+model_name: unsloth/Qwen2.5-3B-Instruct-bnb-4bit
+dataset: Jiayi-Pan/Countdown-Tasks-3to4
+max_response_length: 512
+max_prompt_length: 160
+lora_r: 16
+lora_alpha: 16
+gradient_checkpointing: false # can be unsloth
+gradient_accumulation_steps: 32
+per_device_train_batch_size: 1 # total batch size should be 32
+samples: 50000
+system_prompt: "You are a helpful assistant. You first thinks about the reasoning process in the mind and then provides the user with the answer."
+user_prompt: "Using the numbers {numbers}, create an equation that equals {target}. You can use basic arithmetic operations (+, -, *, /) and each number can only be used once. Show your work in <think> </think> tags. And return the final equation and answer in <answer> </answer> tags, for example <answer> (1 + 2) / 3 </answer>."
+assistant_prompt: "Let me solve this step by step.\n<think>"
+max_steps: 450
+save_steps: 50
+num_generations: 8
+beta: 0.001
+project: "LLM-RL"
+group: "grpo"
+seed: 42
+learning_rate: 5e-7

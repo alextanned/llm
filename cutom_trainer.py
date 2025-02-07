@@ -16,6 +16,7 @@ import os
 import textwrap
 import warnings
 from collections import defaultdict
+from contextlib import contextmanager
 from typing import Any, Callable, Optional, Union
 from unittest.mock import patch
 
@@ -44,6 +45,21 @@ from trl.import_utils import is_vllm_available
 from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
 from trl.trainer.grpo_config import GRPOConfig
 from trl.trainer.utils import generate_model_card, get_comet_experiment_url, pad
+
+
+from unsloth import FastLanguageModel
+original_unwrap_model_for_generation = unwrap_model_for_generation
+
+@contextmanager
+def wrapped_unwrap_model_for_generation(model, accelerator):
+    with original_unwrap_model_for_generation(model, accelerator) as unwrapped_model:
+        inference_model = FastLanguageModel.for_inference(unwrapped_model)  # Enable inference mode
+        try:
+            yield inference_model
+        finally:
+            FastLanguageModel.for_training(inference_model)  # Restore training mode
+
+unwrap_model_for_generation = wrapped_unwrap_model_for_generation
 
 
 if is_peft_available():
@@ -422,6 +438,8 @@ class GRPOTrainer(Trainer):
                 prompt_completion_ids = unwrapped_model.generate(
                     **prompt_inputs, generation_config=self.generation_config
                 )
+
+        prompt_completion_ids = prompt_completion_ids.clone() #  Inference tensors cannot be saved for backward. To work around you can make a clone to get a normal tensor and use it in autograd.
 
         prompt_length = prompt_inputs["input_ids"].size(1)
         completion_ids = prompt_completion_ids[:, prompt_length:]
