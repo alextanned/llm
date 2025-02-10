@@ -12,6 +12,8 @@ from cutom_trainer import GRPOTrainer
 
 import wandb
 
+# TODO it seems that trainer allocates a separate reference model instead of disabling unsloth adapter
+
 def train(cfg: AlgoConfig):
     assert cfg.name != "", "Please provide a name for the experiment"
     # Login to Hugging Face H
@@ -192,15 +194,6 @@ def train(cfg: AlgoConfig):
         report_to="wandb"
     )
 
-    run = wandb.init(
-        project=cfg.project,
-        config=cfg.__dict__ | model_config | peft_config | training_args.__dict__,
-        group=cfg.group,
-        name=cfg.name,
-        id=cfg.name,
-        resume="allow"
-    )
-
     trainer = GRPOTrainer(
         model=model,
         reward_funcs=[format_reward_func, equation_reward_func],
@@ -209,6 +202,43 @@ def train(cfg: AlgoConfig):
         eval_dataset=test_dataset,
     )
 
-    print(run.get_url())
-    trainer.train(resume_from_checkpoint=checkpoint_path)
-    trainer.save_model(training_args.output_dir)
+    if not cfg.test:
+
+        run = wandb.init(
+            project=cfg.project,
+            config=cfg.__dict__ | model_config | peft_config | training_args.__dict__,
+            group=cfg.group,
+            name=cfg.name,
+            id=cfg.name,
+            resume="allow"
+        )
+        print(run.get_url())
+        trainer.train(resume_from_checkpoint=checkpoint_path)
+        trainer.save_model(training_args.output_dir)
+    else:
+        trainer._load_from_checkpoint(checkpoint_path)
+        FastLanguageModel.for_inference(trainer.model)
+        test_case = test_dataset[0]
+        prompt = test_case["prompt"]
+        print("Prompt:", prompt)
+        prompt_tensor = tokenizer(prompt, return_tensors="pt")
+        input_ids = prompt_tensor["input_ids"].cuda()
+        generation = trainer.model.generate(
+            input_ids,
+            max_length=cfg.max_response_length,
+            num_return_sequences=8,
+            temperature=0.9,
+            do_sample=True,
+        )
+        prompt_length = input_ids.shape[1]
+        generated_text = tokenizer.batch_decode(generation[:, prompt_length:], skip_special_tokens=True)
+
+        with open(f"out/{cfg.name}/generations.md", "wb") as f:
+            for text in generated_text:
+                f.write(("\n# Generation\n" + text + "\n\n").encode())
+                format_reward = format_reward_func([text], [test_case["target"]])
+                equation_reward = equation_reward_func([text], [test_case["target"]], [test_case["nums"]])
+                f.write(f"Format Reward: {format_reward}\n\n".encode())
+                f.write(f"Equation Reward: {equation_reward}\n\n".encode())
+                print(f"Format Reward: {format_reward}, Equation Reward: {equation_reward}")
+

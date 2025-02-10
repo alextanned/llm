@@ -23,3 +23,4 @@ project: "LLM-RL"
 group: "grpo"
 seed: 42
 learning_rate: 5e-7
+test: false

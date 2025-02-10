@@ -28,6 +28,8 @@ class AlgoConfig:
     group: str
     seed: int
 
+    test: bool
+
 
 cs = ConfigStore.instance()
 cs.store(name="algo_base", node=AlgoConfig)
