@@ -18,7 +18,7 @@ def train(cfg: AlgoConfig):
     assert cfg.name != "", "Please provide a name for the experiment"
     # Login to Hugging Face H
     with open("hf_token.txt", "r") as f:
-        token = f.read()
+        token = f.read().strip()
     login(token=token)
 
     model_name = cfg.model_name
