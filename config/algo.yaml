@@ -22,5 +22,6 @@ beta: 0.001
 project: "LLM-RL"
 group: "grpo"
 seed: 42
-learning_rate: 5e-7
+learning_rate: 1e-6
 test: false
+optimizer: "adamw_torch"

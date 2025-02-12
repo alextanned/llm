@@ -185,7 +185,7 @@ def train(cfg: AlgoConfig):
         bf16=True,
         save_strategy="steps",
         save_steps=cfg.save_steps,
-        optim = "adamw_8bit",
+        optim = cfg.optimizer,
         # GRPO specific parameters
         max_prompt_length=cfg.max_prompt_length,
         max_completion_length=cfg.max_response_length,  # max length of the generated output for our solution

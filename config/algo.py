@@ -29,6 +29,7 @@ class AlgoConfig:
     seed: int
 
     test: bool
+    optimizer: str
 
 
 cs = ConfigStore.instance()
